@@ -44,6 +44,28 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
     header('Location: review_disputes.php');
     exit();
 }
+$filter = isset($_GET['filter']) ? $_GET['filter'] : 'all';
+$search = isset($_GET['search']) ? $_GET['search'] : '';
+
+// Build the query based on the filter
+$filterQuery = "";
+$params = [];
+
+if ($search) {
+    $filterQuery .= " AND (p.name LIKE :search OR u.name LIKE :search OR ur.name LIKE :search)";
+    $params[':search'] = "%$search%";
+}
+
+switch ($filter) {
+    case 'overdue':  // Change 'meetup' to 'pickup'
+        $filterQuery .= " AND r.status = 'overdue'"; // Assuming pickup status is handled here
+        break;
+    case 'lost':
+        $filterQuery .= " AND r.status = 'lost'";
+        break;
+    default:
+        break;
+}
 
 // Fetch all disputes
 $stmt = $conn->prepare("SELECT d.*, u.name AS user_name, p.name AS product_name 
@@ -54,6 +76,83 @@ $stmt = $conn->prepare("SELECT d.*, u.name AS user_name, p.name AS product_name
                         ORDER BY d.created_at DESC");
 $stmt->execute();
 $disputes = $stmt->fetchAll(PDO::FETCH_ASSOC);
+// Fetch rentals for the owner
+$sql = "SELECT r.*, p.name AS product_name, u.name AS renter_name
+        FROM rentals r
+        INNER JOIN products p ON r.product_id = p.id
+        INNER JOIN users u ON r.renter_id = u.id
+        WHERE r.owner_id = :ownerId
+        ORDER BY r.created_at DESC";
+$stmt = $conn->prepare($sql);
+$stmt->bindParam(':ownerId', $ownerId, PDO::PARAM_INT);
+$stmt->execute();
+$rentals = $stmt->fetchAll(PDO::FETCH_ASSOC);
+
+// Calculate remaining_days for each rental
+foreach ($rentals as &$rental) {
+    if (in_array($rental['status'], ['completed', 'returned'])) {
+        $rental['remaining_days'] = 'Completed';
+    } elseif ($rental['status'] === 'cancelled') {
+        $rental['remaining_days'] = 'Cancelled';
+    } elseif ($rental['status'] === 'overdue') {
+        $rental['remaining_days'] = 'Overdue';
+    } elseif (!empty($rental['end_date'])) { 
+        $today = new DateTime();
+        $endDate = new DateTime($rental['end_date']);
+        $interval = $today->diff($endDate);
+        $days = (int)$interval->format('%R%a'); 
+
+        if ($days > 0) {
+            $rental['remaining_days'] = $days . ' day' . ($days > 1 ? 's' : '');
+        } elseif ($days < 0) {
+            $rental['remaining_days'] = 'Overdue';
+            if ($rental['status'] !== 'overdue') {
+                $updateSql = "UPDATE rentals SET status = 'overdue', updated_at = NOW() WHERE id = :rentalId";
+                $updateStmt = $conn->prepare($updateSql);
+                $updateStmt->bindParam(':rentalId', $rental['id'], PDO::PARAM_INT);
+                $updateStmt->execute();
+                $rental['status'] = 'overdue';
+            }
+        } else {
+            $rental['remaining_days'] = 'Due Today';
+        }
+    } else {
+        $rental['remaining_days'] = 'N/A';
+    }
+}
+unset($rental);
+
+// Define the status flow
+$statusFlow = [
+    'pending_confirmation' => 'Rent Pending',
+    'approved' => 'Rent Confirmed',
+    'delivery_in_progress' => 'Delivery in Progress',
+    'delivered' => 'Delivered',
+    'renting' => 'Renting',
+    'completed' => 'Completed',
+    'returned' => 'Returned',
+    'cancelled' => 'Cancelled',
+    'overdue' => 'Overdue'
+];
+
+// Helper function to determine if a status should be active
+function isStatusActive($statusKey, $currentStatus, $statusFlow) {
+    $keys = array_keys($statusFlow);
+    $currentIndex = array_search($currentStatus, $keys);
+    $statusIndex = array_search($statusKey, $keys);
+
+    if ($statusIndex === false) {
+        return false;
+    }
+
+    return $statusIndex <= $currentIndex;
+}
+
+// Generate CSRF token for security
+if (empty($_SESSION['csrf_token'])) {
+    $_SESSION['csrf_token'] = bin2hex(random_bytes(32));
+}
+
 ?>
 <!DOCTYPE html>
 <html lang="en">
@@ -88,7 +187,30 @@ $disputes = $stmt->fetchAll(PDO::FETCH_ASSOC);
                     </div>
                     <?php unset($_SESSION['error_message']); ?>
                 <?php endif; ?>
-
+                <form method="get" action="" class="w-100">
+                 <div class="d-flex w-100">
+                    <input type="text" name="search" class="form-control w-75" placeholder="Search" value="<?= htmlspecialchars($search) ?>">
+                    <div class="d-flex ms-2">
+                        <select class="form-select me-2" name="sort_by" style="width: auto;">
+                            <option selected>Sort by</option>
+                            <option value="1" <?= isset($_GET['sort_by']) && $_GET['sort_by'] == '1' ? 'selected' : '' ?>>Rental ID</option>
+                            <option value="2" <?= isset($_GET['sort_by']) && $_GET['sort_by'] == '2' ? 'selected' : '' ?>>Gadget</option>
+                        </select>
+                        <button class="btn btn-outline-secondary" type="submit"><i class="fas fa-search"></i></button>
+                    </div>
+                 </div>
+                </form>
+                <ul class="nav nav-tabs mb-3" id="transactionTabs" role="tablist">
+                        <li class="nav-item" role="presentation">
+                            <a class="nav-link <?= $filter == 'all' ? 'active' : '' ?>" href="?filter=all&search=<?= htmlspecialchars($search) ?>" role="tab">All</a>
+                        </li>
+                        <li class="nav-item" role="presentation">
+                            <a class="nav-link <?= $filter == 'overdue' ? 'active' : '' ?>" href="?filter=pickup&search=<?= htmlspecialchars($search) ?>" role="tab">Overdue</a>
+                        </li>
+                        <li class="nav-item" role="presentation">
+                            <a class="nav-link <?= $filter == 'lost' ? 'active' : '' ?>" href="?filter=rented&search=<?= htmlspecialchars($search) ?>" role="tab">Lost Devices</a>
+                        </li>
+                    </ul>
                 <table class="table table-striped">
                     <thead>
                         <tr>
@@ -124,6 +246,8 @@ $disputes = $stmt->fetchAll(PDO::FETCH_ASSOC);
                                         <button type="button" class="btn btn-sm btn-primary" data-bs-toggle="modal" data-bs-target="#updateDisputeModal<?= $dispute['id'] ?>">
                                             Update
                                         </button>
+                                        <!-- View Button -->
+                                        <a href="view_rental.php?rental_id=<?= htmlspecialchars($dispute['rental_id']) ?>" class="btn btn-info btn-sm">View</a>
 
                                         <!-- Modal -->
                                         <div class="modal fade" id="updateDisputeModal<?= $dispute['id'] ?>" tabindex="-1" aria-labelledby="updateDisputeModalLabel<?= $dispute['id'] ?>" aria-hidden="true">
